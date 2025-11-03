@@ -1,0 +1,8 @@
+*.exe
+*.dll
+*.so
+*.bin
+*.o
+*.a
+*.out
+*.[!a-zA-Z0-9]*  # This pattern matches files without an extension

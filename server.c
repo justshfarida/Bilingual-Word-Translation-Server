@@ -2,59 +2,73 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
+#include <time.h>
+#include <unistd.h>
 #include <linux/limits.h>
+
 #define MAX_WORD_LENGTH 50
+#define DICTIONARY_DIR "./dictionary_files"
 
 typedef struct {
     char english[MAX_WORD_LENGTH];
     char french[MAX_WORD_LENGTH];
 } WordPair;
 
-// Function to read a file and add word pairs to the dictionary
-int read_word_pairs_from_file(const char *filename, WordPair **dictionary, int *size) {
+WordPair *dictionary = NULL;
+int dictionary_size = 0;
+
+void handle_usr1(int sig) {
+    // Handle SIGUSR1: Print English-to-French translation
+    if (dictionary_size > 0) {
+        int index = rand() % dictionary_size;  // Select a random index
+        printf("English: %s -> French: %s\n", dictionary[index].english, dictionary[index].french);
+    }
+}
+
+void handle_usr2(int sig) {
+    // Handle SIGUSR2: Print French-to-English translation
+    if (dictionary_size > 0) {
+        int index = rand() % dictionary_size;  // Select a random index
+        printf("French: %s -> English: %s\n", dictionary[index].french, dictionary[index].english);
+    }
+}
+
+int read_word_pairs_from_file(const char *filename) {
     FILE *file = fopen(filename, "r");
     if (!file) {
         perror("Error opening file");
         return 0;
     }
 
-    char english[MAX_WORD_LENGTH];
-    char french[MAX_WORD_LENGTH];
+    char english[MAX_WORD_LENGTH], french[MAX_WORD_LENGTH];
 
-    // Read word pairs from the file
     while (fscanf(file, "%49[^;];%49s\n", english, french) == 2) {
-        // Allocate memory for the new word pair
-        *size += 1;
-        *dictionary = realloc(*dictionary, *size * sizeof(WordPair));
+        dictionary_size += 1;
+        dictionary = realloc(dictionary, dictionary_size * sizeof(WordPair));
 
-        if (*dictionary == NULL) {
+        if (dictionary == NULL) {
             perror("Realloc failed");
             fclose(file);
             return 0;
         }
 
-        // Store the word pair in the dictionary
-        strncpy((*dictionary)[*size - 1].english, english, MAX_WORD_LENGTH);
-        strncpy((*dictionary)[*size - 1].french, french, MAX_WORD_LENGTH);
+        strncpy(dictionary[dictionary_size - 1].english, english, MAX_WORD_LENGTH);
+        strncpy(dictionary[dictionary_size - 1].french, french, MAX_WORD_LENGTH);
     }
 
     fclose(file);
     return 1;
 }
 
-// Function to check the directory and process files
-int check_directory(char *pathname) {
-    DIR *openedDir = opendir(pathname);
+int check_directory_for_new_files() {
+    DIR *openedDir = opendir(DICTIONARY_DIR);
     if (!openedDir) {
         perror("Error opening directory");
         return 0;
     }
 
     struct dirent *dir;
-    WordPair *dictionary = NULL;
-    int size = 0;
-
-    // Loop through all the entries in the directory
     while ((dir = readdir(openedDir)) != NULL) {
         // Skip "." and ".." entries
         if (strcmp(dir->d_name, ".") == 0 || strcmp(dir->d_name, "..") == 0) {
@@ -62,31 +76,36 @@ int check_directory(char *pathname) {
         }
 
         char file_path[PATH_MAX];
-        snprintf(file_path, sizeof(file_path), "%s/%s", pathname, dir->d_name);
+        snprintf(file_path, sizeof(file_path), "%s/%s", DICTIONARY_DIR, dir->d_name);
 
         // Read word pairs from the current file
-        if (!read_word_pairs_from_file(file_path, &dictionary, &size)) {
+        if (!read_word_pairs_from_file(file_path)) {
             closedir(openedDir);
             return 0;
         }
     }
 
     closedir(openedDir);
-
-    // Print the dictionary (for debugging)
-    for (int i = 0; i < size; i++) {
-        printf("English: %s, French: %s\n", dictionary[i].english, dictionary[i].french);
-    }
-
-    // Free the allocated memory
-    free(dictionary);
     return 1;
 }
 
 int main() {
-    char *directory = "./dictionary_files"; // Change this to your directory
-    if (!check_directory(directory)) {
+    // Register signal handlers
+    signal(SIGUSR1, handle_usr1);
+    signal(SIGUSR2, handle_usr2);
+
+    // Load dictionary initially
+    if (!check_directory_for_new_files()) {
         printf("Error processing the directory\n");
+        return 1;
     }
+
+    // Main loop to keep the server running and responsive to signals
+    while (1) {
+        pause();  // Wait for signals (blocks until a signal is received)
+    }
+
+    // Clean up
+    free(dictionary);
     return 0;
 }
