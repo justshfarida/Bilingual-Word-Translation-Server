@@ -1,3 +1,4 @@
+# direction: EN_FR
 hello;bonjour
 cat;chat
 dog;chien

@@ -1,3 +1,4 @@
+# direction: EN_FR
 bye;salut
 horse;cheval
 pen;stylo
