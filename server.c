@@ -45,7 +45,36 @@ typedef struct {
 
 FileInfo tracked_files[128];
 int tracked_count = 0;
+static const char *PID_FILE = "/tmp/dict_server.pid";
 
+static int write_pid_file(const char *path, pid_t pid) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+
+    FILE *f = fopen(tmp, "w");
+    if (!f) return -1;
+    fprintf(f, "%d\n", pid);
+    fflush(f);
+    int fd = fileno(f);
+    if (fd != -1) fsync(fd);
+    fclose(f);
+
+    if (rename(tmp, path) == -1) {
+        remove(tmp);
+        return -1;
+    }
+    return 0;
+}
+
+static void remove_pid_file(void) {
+    unlink(PID_FILE);
+}
+
+static void handle_sigint(int sig) {
+    (void)sig;
+    remove_pid_file();
+    _exit(0);
+}
 void handle_usr1(int sig) {
     // Handle SIGUSR1: Print English-to-French translation
     pthread_mutex_lock(&shared_dict->mutex);
@@ -266,7 +295,16 @@ int main() {
     // Register signal handlers (for random test)
     signal(SIGUSR1, handle_usr1);
     signal(SIGUSR2, handle_usr2);
+     pid_t mypid = getpid();
+    if (write_pid_file(PID_FILE, mypid) != 0) {
+        perror("write_pid_file");
+    }
+    atexit(remove_pid_file);              
+    struct sigaction sa_int = {0};
+    sa_int.sa_handler = handle_sigint;     
+    sigaction(SIGINT, &sa_int, NULL);
 
+    printf("Server PID: %d (pid fayl: %s)\n", mypid, PID_FILE);
     // Main loop
     while (1) pause();
 
