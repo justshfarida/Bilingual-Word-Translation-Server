@@ -1,56 +1,43 @@
-#include <dirent.h>
+// server.c — Unified V1+V2+V3 server
+// - V1: handles SIGUSR1/SIGUSR2 to print a random pair (demo mode)
+// - V2: writer thread scans dictionary files -> queues lines -> reader thread fills shared memory
+// - V3: request handler handles client requests; on MISS it rescans immediately, then rechecks
+
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <dirent.h>
 #include <signal.h>
 #include <time.h>
 #include <unistd.h>
-#include <pthread.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <sys/msg.h>
 #include <sys/stat.h>
-#include <linux/limits.h>
+#include <limits.h>
 
-#define MAX_WORD_LENGTH 50
-#define DICTIONARY_DIR "./dictionary_files"
-#define SHM_KEY 1234
-#define MSG_KEY 5678
-#define MAX_WORDS 1024
+#include "proto.h"
 
-typedef struct {
-    char english[MAX_WORD_LENGTH];
-    char french[MAX_WORD_LENGTH];
-} WordPair;
+// ---------- Globals ----------
+static SharedDictionary *g_dict = NULL;
+static int g_word_q  = -1;   // queue for file->word pairs
+static int g_req_q   = -1;   // queue for client requests
+static int g_resp_q  = -1;   // queue for server replies
 
-typedef struct {
-    WordPair words[MAX_WORDS];
-    int size;
-    pthread_mutex_t mutex;
-} SharedDictionary;
+// Track scanned files & mtimes to avoid resending unchanged content
+typedef struct { char filename[PATH_MAX]; time_t mtime; } FileInfo;
+static FileInfo g_tracked[512];
+static int g_tracked_count = 0;
 
-SharedDictionary *shared_dict = NULL;
+static volatile sig_atomic_t g_want_random_enfr = 0;
+static volatile sig_atomic_t g_want_random_fren = 0;
 
-typedef struct {
-    long mtype; // 1 = EN_FR, 2 = FR_EN
-    char english[MAX_WORD_LENGTH];
-    char french[MAX_WORD_LENGTH];
-} Msg;
-
-// For tracking file timestamps
-typedef struct {
-    char filename[PATH_MAX];
-    time_t mtime;
-} FileInfo;
-
-FileInfo tracked_files[128];
-int tracked_count = 0;
-static const char *PID_FILE = "/tmp/dict_server.pid";
-
-static int write_pid_file(const char *path, pid_t pid) {
+// ---------- PID file helpers ----------
+static int write_pid_file_atomic(const char *path, pid_t pid) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-
     FILE *f = fopen(tmp, "w");
     if (!f) return -1;
     fprintf(f, "%d\n", pid);
@@ -58,11 +45,7 @@ static int write_pid_file(const char *path, pid_t pid) {
     int fd = fileno(f);
     if (fd != -1) fsync(fd);
     fclose(f);
-
-    if (rename(tmp, path) == -1) {
-        remove(tmp);
-        return -1;
-    }
+    if (rename(tmp, path) == -1) { remove(tmp); return -1; }
     return 0;
 }
 
@@ -70,249 +53,290 @@ static void remove_pid_file(void) {
     unlink(PID_FILE);
 }
 
-static void handle_sigint(int sig) {
+static void on_sigint_term(int sig) {
     (void)sig;
     remove_pid_file();
+    // release IPC resources that we own
+    // NOTE: If you want to fully remove shared memory and queues on exit, uncomment:
+    // shmctl(shmget(SHM_KEY, 0, 0), IPC_RMID, NULL);
+    // msgctl(g_word_q, IPC_RMID, NULL);
+    // msgctl(g_req_q,  IPC_RMID, NULL);
+    // msgctl(g_resp_q, IPC_RMID, NULL);
     _exit(0);
 }
-void handle_usr1(int sig) {
-    // Handle SIGUSR1: Print English-to-French translation
-    pthread_mutex_lock(&shared_dict->mutex);
-    if (shared_dict->size > 0) {
-        int idx = rand() % shared_dict->size;
-        printf("English: %s -> French: %s\n",
-               shared_dict->words[idx].english,
-               shared_dict->words[idx].french);
+
+// ---------- Signal handlers (V1 demo) ----------
+static void h_usr1(int s) { (void)s; g_want_random_enfr = 1; }
+static void h_usr2(int s) { (void)s; g_want_random_fren = 1; }
+
+static void maybe_print_random(void) {
+    int dir = 0; // 1 EN->FR, 2 FR->EN
+    if (g_want_random_enfr) { dir = 1; g_want_random_enfr = 0; }
+    else if (g_want_random_fren) { dir = 2; g_want_random_fren = 0; }
+    if (!dir) return;
+
+    pthread_mutex_lock(&g_dict->mutex);
+    if (g_dict->size > 0) {
+        int idx = rand() % g_dict->size;
+        if (dir == 1)
+            printf("[RANDOM EN→FR] %s -> %s\n", g_dict->words[idx].english, g_dict->words[idx].french);
+        else
+            printf("[RANDOM FR→EN] %s -> %s\n", g_dict->words[idx].french, g_dict->words[idx].english);
+        fflush(stdout);
     }
-    pthread_mutex_unlock(&shared_dict->mutex);
+    pthread_mutex_unlock(&g_dict->mutex);
 }
 
-void handle_usr2(int sig) {
-    // Handle SIGUSR2: Print French-to-English translation
-    pthread_mutex_lock(&shared_dict->mutex);
-    if (shared_dict->size > 0) {
-        int idx = rand() % shared_dict->size;
-        printf("French: %s -> English: %s\n",
-               shared_dict->words[idx].french,
-               shared_dict->words[idx].english);
-    }
-    pthread_mutex_unlock(&shared_dict->mutex);
+// ---------- Tracked files ----------
+static int tracked_find(const char *name) {
+    for (int i = 0; i < g_tracked_count; ++i)
+        if (strcmp(g_tracked[i].filename, name) == 0) return i;
+    return -1;
 }
 
-int is_new_file(const char *filename, time_t mtime) {
-    // Check if file is new or modified
-    for (int i = 0; i < tracked_count; i++) {
-        if (strcmp(tracked_files[i].filename, filename) == 0) {
-            return mtime > tracked_files[i].mtime;
+static int is_new_or_modified(const char *name, time_t mtime) {
+    int i = tracked_find(name);
+    if (i < 0) return 1;            // new file
+    return mtime > g_tracked[i].mtime; // modified
+}
+
+static void tracked_update(const char *name, time_t mtime) {
+    int i = tracked_find(name);
+    if (i >= 0) { g_tracked[i].mtime = mtime; return; }
+    if (g_tracked_count < (int)(sizeof(g_tracked)/sizeof(g_tracked[0]))) {
+        strncpy(g_tracked[g_tracked_count].filename, name, PATH_MAX-1);
+        g_tracked[g_tracked_count].filename[PATH_MAX-1] = '\0';
+        g_tracked[g_tracked_count].mtime = mtime;
+        g_tracked_count++;
+    }
+}
+
+// ---------- Dictionary pipeline helpers ----------
+static void send_line_to_queue(const char *eng, const char *fr, long dir_mtype) {
+    MsgWord m; memset(&m, 0, sizeof(m));
+    m.mtype = dir_mtype; // 1 EN->FR, 2 FR->EN
+    strncpy(m.english, eng, MAX_WORD_LENGTH-1);
+    strncpy(m.french,  fr, MAX_WORD_LENGTH-1);
+    if (msgsnd(g_word_q, &m, sizeof(MsgWord) - sizeof(long), 0) == -1) {
+        perror("msgsnd(word)");
+    }
+}
+
+static void read_word_pairs_from_file(const char *filepath, long *out_dir_mtype) {
+    // Detect direction from the very first line (optional): "# direction: EN_FR" or "FR_EN"
+    FILE *f = fopen(filepath, "r");
+    if (!f) { perror("fopen"); return; }
+
+    long dir_mtype = 1; // default EN->FR
+    char line[256];
+    if (fgets(line, sizeof(line), f)) {
+        if (strstr(line, "FR_EN")) dir_mtype = 2;
+        else if (strstr(line, "EN_FR")) dir_mtype = 1;
+        else {
+            // Not a direction header, rewind to treat as data line
+            fseek(f, 0, SEEK_SET);
         }
     }
-    return 1; // not tracked yet
-}
 
-void update_tracked_file(const char *filename, time_t mtime) {
-    // Update tracked file info
-    for (int i = 0; i < tracked_count; i++) {
-        if (strcmp(tracked_files[i].filename, filename) == 0) {
-            tracked_files[i].mtime = mtime;
-            return;
-        }
+    while (fgets(line, sizeof(line), f)) {
+        // Expected format per line: english;french\n
+        // Trim trailing newline
+        char *nl = strchr(line, '\n'); if (nl) *nl = '\0';
+
+        char *semi = strchr(line, ';');
+        if (!semi) continue; // skip bad line
+        *semi = '\0';
+
+        const char *eng = line;
+        const char *fr  = semi + 1;
+        if (*eng == '\0' || *fr == '\0') continue;
+        send_line_to_queue(eng, fr, dir_mtype);
     }
-    // New file
-    strncpy(tracked_files[tracked_count].filename, filename, PATH_MAX);
-    tracked_files[tracked_count].mtime = mtime;
-    tracked_count++;
+
+    fclose(f);
+    if (out_dir_mtype) *out_dir_mtype = dir_mtype;
 }
 
-void read_word_pairs_from_file(const char *filename, int direction, int msgid) {
-    // Read word pairs from file and send to message queue
-    FILE *file = fopen(filename, "r");
-    if (!file) {
-        perror("Error opening file");
+static void rescan_dictionary_once(void) {
+    DIR *dir = opendir(DICTIONARY_DIR);
+    if (!dir) {
+        perror("opendir(dictionary)");
         return;
     }
 
-    char line[128];
-    // Skip first line if it's direction marker
-    if (fgets(line, sizeof(line), file) && strstr(line, "# direction:") != NULL) {
-        // first line processed
-    } else {
-        rewind(file); // no direction line
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s", DICTIONARY_DIR, de->d_name);
+
+        struct stat st;
+        if (stat(path, &st) == -1) continue;
+        if (!S_ISREG(st.st_mode)) continue;
+
+        if (!is_new_or_modified(de->d_name, st.st_mtime)) continue;
+
+        long dir_mtype = 1;
+        read_word_pairs_from_file(path, &dir_mtype);
+        tracked_update(de->d_name, st.st_mtime);
     }
 
-    while (fgets(line, sizeof(line), file)) {
-        char *eng = strtok(line, ";\n");
-        char *fr = strtok(NULL, ";\n");
-        if (eng && fr) {
-            Msg msg;
-            msg.mtype = direction;
-            strncpy(msg.english, eng, MAX_WORD_LENGTH);
-            strncpy(msg.french, fr, MAX_WORD_LENGTH);
-            if (msgsnd(msgid, &msg, sizeof(Msg) - sizeof(long), 0) == -1) {
-                perror("msgsnd");
-            }
-        }
-    }
-
-    fclose(file);
+    closedir(dir);
 }
 
-void *writer_thread(void *arg) {
-    int msgid = *((int *)arg);
-
-    while (1) {
-        DIR *dir = opendir(DICTIONARY_DIR);
-        if (!dir) {
-            perror("Error opening directory");
-            sleep(5);
-            continue;
-        }
-
-        struct dirent *entry;
-        while ((entry = readdir(dir)) != NULL) {
-            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
-                continue;
-
-            char filepath[PATH_MAX];
-            snprintf(filepath, sizeof(filepath), "%s/%s", DICTIONARY_DIR, entry->d_name);
-
-            struct stat st;
-            if (stat(filepath, &st) == -1) continue;
-
-            if (!is_new_file(entry->d_name, st.st_mtime)) continue;
-            
-            // Determine direction from first line (example: "# direction: EN_FR")
-            FILE *f = fopen(filepath, "r");
-            int direction = 1; // default EN_FR
-            if (f) {
-                char first_line[128];
-                if (fgets(first_line, sizeof(first_line), f)) {
-                    if (strstr(first_line, "FR_EN") != NULL) direction = 2;
-                }
-                fclose(f);
-            }
-
-            read_word_pairs_from_file(filepath, direction, msgid);
-            update_tracked_file(entry->d_name, st.st_mtime);
-        }
-
-        closedir(dir);
+// ---------- Threads ----------
+static void *writer_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        rescan_dictionary_once();
         sleep(5); // periodic scan
     }
-
     return NULL;
 }
 
-void *reader_thread(void *arg) {
-    int msgid = *((int *)arg);
-    Msg msg;
+static void *reader_thread(void *arg) {
+    (void)arg;
+    MsgWord m;
+    for (;;) {
+        ssize_t n = msgrcv(g_word_q, &m, sizeof(MsgWord) - sizeof(long), 0, 0);
+        if (n == -1) { perror("msgrcv(word)"); continue; }
 
-    while (1) {
-        if (msgrcv(msgid, &msg, sizeof(Msg) - sizeof(long), 0, 0) == -1) {
-            perror("msgrcv failed");
-            continue;
-        }
-
-        pthread_mutex_lock(&shared_dict->mutex);
-        if (shared_dict->size < MAX_WORDS) {
-            if (msg.mtype == 1) { // EN_FR
-                strncpy(shared_dict->words[shared_dict->size].english, msg.english, MAX_WORD_LENGTH);
-                strncpy(shared_dict->words[shared_dict->size].french, msg.french, MAX_WORD_LENGTH);
-            } else { // FR_EN
-                strncpy(shared_dict->words[shared_dict->size].english, msg.french, MAX_WORD_LENGTH);
-                strncpy(shared_dict->words[shared_dict->size].french, msg.english, MAX_WORD_LENGTH);
+        pthread_mutex_lock(&g_dict->mutex);
+        if (g_dict->size < MAX_WORDS) {
+            if (m.mtype == 1) { // EN->FR as given
+                strncpy(g_dict->words[g_dict->size].english, m.english, MAX_WORD_LENGTH-1);
+                strncpy(g_dict->words[g_dict->size].french,  m.french,  MAX_WORD_LENGTH-1);
+            } else {            // FR->EN, normalize to english/french field order
+                strncpy(g_dict->words[g_dict->size].english, m.french,  MAX_WORD_LENGTH-1);
+                strncpy(g_dict->words[g_dict->size].french,  m.english, MAX_WORD_LENGTH-1);
             }
-
-            shared_dict->size++;
+            g_dict->size++;
+        } else {
+            // Dictionary is full; you can choose to overwrite or drop
+            // Here we simply drop and warn once in a while
+            if ((g_dict->size % 100) == 0)
+                fprintf(stderr, "[WARN] dictionary full, skipping pairs...\n");
         }
-        pthread_mutex_unlock(&shared_dict->mutex);
+        pthread_mutex_unlock(&g_dict->mutex);
     }
-
     return NULL;
 }
 
-// int check_directory_for_new_files() {
-//     DIR *openedDir = opendir(DICTIONARY_DIR);
-//     if (!openedDir) {
-//         perror("Error opening directory");
-//         return 0;
-//     }
+static int lookup(int dir /*1 EN->FR, 2 FR->EN*/, const char *w, char out[MAX_WORD_LENGTH]) {
+    int found = 0;
+    pthread_mutex_lock(&g_dict->mutex);
+    for (int i = 0; i < g_dict->size; ++i) {
+        if (dir == 1) {
+            if (strcmp(g_dict->words[i].english, w) == 0) { strncpy(out, g_dict->words[i].french, MAX_WORD_LENGTH-1); found = 1; break; }
+        } else {
+            if (strcmp(g_dict->words[i].french,  w) == 0) { strncpy(out, g_dict->words[i].english, MAX_WORD_LENGTH-1); found = 1; break; }
+        }
+    }
+    pthread_mutex_unlock(&g_dict->mutex);
+    return found;
+}
 
-//     struct dirent *dir;
-//     while ((dir = readdir(openedDir)) != NULL) {
-//         // Skip "." and ".." entries
-//         if (strcmp(dir->d_name, ".") == 0 || strcmp(dir->d_name, "..") == 0) {
-//             continue;
-//         }
+static void *request_handler_thread(void *arg) {
+    (void)arg;
+    MsgReq r; MsgResp s;
+    for (;;) {
+        ssize_t n = msgrcv(g_req_q, &r, sizeof(MsgReq) - sizeof(long), 0, 0);
+        if (n == -1) { perror("msgrcv(req)"); continue; }
 
-//         char file_path[PATH_MAX];
-//         snprintf(file_path, sizeof(file_path), "%s/%s", DICTIONARY_DIR, dir->d_name);
+        memset(&s, 0, sizeof(s));
+        s.mtype = r.reply_to;   // reply specifically to that client PID
+        s.req_id = r.req_id;
+        strncpy(s.from, r.word, MAX_WORD_LENGTH-1);
 
-//         // Read word pairs from the current file
-//         if (!read_word_pairs_from_file(file_path)) {
-//             closedir(openedDir);
-//             return 0;
-//         }
-//     }
+        char tmp[MAX_WORD_LENGTH] = {0};
+        int dir = (int)r.mtype; // 1 EN->FR, 2 FR->EN
+        if (!lookup(dir, r.word, tmp)) {
+            // MISS: perform immediate rescan (V3 requirement), then recheck
+            rescan_dictionary_once();
+            if (lookup(dir, r.word, tmp)) {
+                s.found = 1;
+                strncpy(s.to, tmp, MAX_WORD_LENGTH-1);
+            } else {
+                s.found = 0;
+            }
+        } else {
+            s.found = 1;
+            strncpy(s.to, tmp, MAX_WORD_LENGTH-1);
+        }
 
-//     closedir(openedDir);
-//     return 1;
-// }
+        if (msgsnd(g_resp_q, &s, sizeof(MsgResp) - sizeof(long), 0) == -1) {
+            perror("msgsnd(resp)");
+        }
+    }
+    return NULL;
+}
 
-int main() {
-   srand(time(NULL));
-
-    // Setup shared memory
+// ---------- Bootstrap shared memory ----------
+static SharedDictionary *attach_or_init_shm(void) {
     int shmid = shmget(SHM_KEY, sizeof(SharedDictionary), IPC_CREAT | 0666);
-    if (shmid == -1) {
-        perror("shmget failed");
+    if (shmid == -1) { perror("shmget"); return NULL; }
+
+    SharedDictionary *p = (SharedDictionary *)shmat(shmid, NULL, 0);
+    if (p == (void *)-1) { perror("shmat"); return NULL; }
+
+    // One-time init of the process-shared mutex
+    if (p->initialized != 1) {
+        memset(p, 0, sizeof(*p));
+        pthread_mutexattr_t attr; pthread_mutexattr_init(&attr);
+        pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
+        pthread_mutex_init(&p->mutex, &attr);
+        pthread_mutexattr_destroy(&attr);
+        p->size = 0;
+        p->initialized = 1;
+    }
+    return p;
+}
+
+int main(void) {
+    srand((unsigned)time(NULL));
+
+    // 1) IPC setup
+    g_dict = attach_or_init_shm();
+    if (!g_dict) return 1;
+
+    g_word_q = msgget(MSG_WORD_KEY, IPC_CREAT | 0666);
+    g_req_q  = msgget(MSG_REQ_KEY,  IPC_CREAT | 0666);
+    g_resp_q = msgget(MSG_RESP_KEY, IPC_CREAT | 0666);
+    if (g_word_q == -1 || g_req_q == -1 || g_resp_q == -1) {
+        perror("msgget");
         return 1;
     }
 
-    shared_dict = shmat(shmid, NULL, 0);
-    if (shared_dict == (void *)-1) {
-        perror("shmat failed");
-        return 1;
-    }
-
-    shared_dict->size = 0;
-    pthread_mutexattr_t attr;
-    pthread_mutexattr_init(&attr);
-    pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
-    pthread_mutex_init(&shared_dict->mutex, &attr);
-
-    // Setup message queue
-    int msgid = msgget(MSG_KEY, IPC_CREAT | 0666);
-    if (msgid == -1) {
-        perror("msgget failed");
-        return 1;
-    }
-
-    // Create writer and reader threads
-    pthread_t writer, reader;
-    pthread_create(&writer, NULL, writer_thread, &msgid);
-    pthread_create(&reader, NULL, reader_thread, &msgid);
-
-    // Register signal handlers (for random test)
-    signal(SIGUSR1, handle_usr1);
-    signal(SIGUSR2, handle_usr2);
-     pid_t mypid = getpid();
-    if (write_pid_file(PID_FILE, mypid) != 0) {
+    // 2) PID file + termination handlers
+    pid_t mypid = getpid();
+    if (write_pid_file_atomic(PID_FILE, mypid) != 0) {
         perror("write_pid_file");
     }
-    atexit(remove_pid_file);              
-    struct sigaction sa_int = {0};
-    sa_int.sa_handler = handle_sigint;     
-    sigaction(SIGINT, &sa_int, NULL);
+    atexit(remove_pid_file);
+    struct sigaction sa_term = {0}; sa_term.sa_handler = on_sigint_term; sigaction(SIGINT, &sa_term, NULL); sigaction(SIGTERM, &sa_term, NULL);
 
-    printf("Server PID: %d (pid fayl: %s)\n", mypid, PID_FILE);
-    // Main loop
-    while (1) pause();
+    // 3) Random demo signals (V1) — optional
+    struct sigaction sa1 = {0}, sa2 = {0};
+    sa1.sa_handler = h_usr1; sigaction(SIGUSR1, &sa1, NULL);
+    sa2.sa_handler = h_usr2; sigaction(SIGUSR2, &sa2, NULL);
 
-    // Cleanup (never reached in this demo)
-    pthread_mutex_destroy(&shared_dict->mutex);
-    shmdt(shared_dict);
-    shmctl(shmid, IPC_RMID, NULL);
-    msgctl(msgid, IPC_RMID, NULL);
+    printf("Server PID: %d (pid file: %s)\n", mypid, PID_FILE);
+    fflush(stdout);
+
+    // 4) Threads
+    pthread_t th_writer, th_reader, th_req;
+    pthread_create(&th_writer, NULL, writer_thread, NULL);
+    pthread_create(&th_reader, NULL, reader_thread, NULL);
+    pthread_create(&th_req,    NULL, request_handler_thread, NULL);
+
+    // 5) Simple event loop: wake on signals and print random if requested
+    for (;;) {
+        pause();           // blocked until a signal arrives
+        maybe_print_random();
+        // NOTE: threads keep running independently; no need to wake them here
+    }
 
     return 0;
 }
+
+
