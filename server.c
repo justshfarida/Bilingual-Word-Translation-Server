@@ -34,6 +34,18 @@ static int g_tracked_count = 0;
 static volatile sig_atomic_t g_want_random_enfr = 0;
 static volatile sig_atomic_t g_want_random_fren = 0;
 
+static void debug_print_dictionary(void) {
+    pthread_mutex_lock(&g_dict->mutex);
+
+    printf("\n==== SHARED DICTIONARY (%d entries) ====\n", g_dict->size);
+    for (int i = 0; i < g_dict->size; ++i) {
+        printf("  [%d] %s -> %s\n", i, g_dict->words[i].english, g_dict->words[i].french);
+    }
+    printf("=======================================\n\n");
+
+    pthread_mutex_unlock(&g_dict->mutex);
+}
+
 // ---------- PID file helpers ----------
 static int write_pid_file_atomic(const char *path, pid_t pid) {
     char tmp[256];
@@ -157,7 +169,7 @@ static void read_word_pairs_from_file(const char *filepath, long *out_dir_mtype)
     if (out_dir_mtype) *out_dir_mtype = dir_mtype;
 }
 
-static void rescan_dictionary_once(void) {
+static void rescan_dictionary_once(int force_reload) {
     DIR *dir = opendir(DICTIONARY_DIR);
     if (!dir) {
         perror("opendir(dictionary)");
@@ -174,11 +186,12 @@ static void rescan_dictionary_once(void) {
         if (stat(path, &st) == -1) continue;
         if (!S_ISREG(st.st_mode)) continue;
 
-        if (!is_new_or_modified(de->d_name, st.st_mtime)) continue;
-
-        long dir_mtype = 1;
-        read_word_pairs_from_file(path, &dir_mtype);
-        tracked_update(de->d_name, st.st_mtime);
+        if (force_reload || is_new_or_modified(de->d_name, st.st_mtime)) {
+            printf("Reloading dictionary file: %s\n", path);
+            long dir_mtype = 1;
+            read_word_pairs_from_file(path, &dir_mtype);
+            tracked_update(de->d_name, st.st_mtime);
+        }        
     }
 
     closedir(dir);
@@ -188,7 +201,9 @@ static void rescan_dictionary_once(void) {
 static void *writer_thread(void *arg) {
     (void)arg;
     for (;;) {
-        rescan_dictionary_once();
+        rescan_dictionary_once(0);
+        printf("[DEBUG] Reload complete.\n");
+        debug_print_dictionary();
         sleep(5); // periodic scan
     }
     return NULL;
@@ -252,7 +267,9 @@ static void *request_handler_thread(void *arg) {
         int dir = (int)r.mtype; // 1 EN->FR, 2 FR->EN
         if (!lookup(dir, r.word, tmp)) {
             // MISS: perform immediate rescan (V3 requirement), then recheck
-            rescan_dictionary_once();
+            rescan_dictionary_once(1);
+            printf("[DEBUG] Reload complete.\n");
+            debug_print_dictionary();
             if (lookup(dir, r.word, tmp)) {
                 s.found = 1;
                 strncpy(s.to, tmp, MAX_WORD_LENGTH-1);
