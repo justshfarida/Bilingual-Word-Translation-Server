@@ -1,0 +1,4 @@
+# direction: FR_EN
+lait;milk
+chaise;chair
+maison;house

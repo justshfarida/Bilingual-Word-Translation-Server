@@ -1,0 +1,4 @@
+# direction: EN_FR
+apple;pomme
+book;livre
+flower;fleur

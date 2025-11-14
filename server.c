@@ -33,6 +33,33 @@ static int g_tracked_count = 0;
 
 static volatile sig_atomic_t g_want_random_enfr = 0;
 static volatile sig_atomic_t g_want_random_fren = 0;
+static volatile sig_atomic_t g_running = 1;
+
+static void cleanup_ipc(void) {
+    // detach shared memory
+    if (g_dict != NULL) {
+        shmdt(g_dict);
+        g_dict = NULL;
+    }
+
+    // remove shared memory segment
+    shmctl(SHM_KEY, IPC_RMID, NULL);
+
+    // remove message queues
+    if (g_word_q != -1) msgctl(g_word_q, IPC_RMID, NULL);
+    if (g_req_q  != -1) msgctl(g_req_q,  IPC_RMID, NULL);
+    if (g_resp_q != -1) msgctl(g_resp_q, IPC_RMID, NULL);
+
+    g_word_q = g_req_q = g_resp_q = -1;
+}
+
+static void handle_term(int sig) {
+    (void)sig;
+    g_running = 0;      // tell threads to stop
+    sleep(1);           // give threads a moment to exit
+    cleanup_ipc();
+    exit(0);
+}
 
 static void debug_print_dictionary(void) {
     pthread_mutex_lock(&g_dict->mutex);
@@ -63,18 +90,6 @@ static int write_pid_file_atomic(const char *path, pid_t pid) {
 
 static void remove_pid_file(void) {
     unlink(PID_FILE);
-}
-
-static void on_sigint_term(int sig) {
-    (void)sig;
-    remove_pid_file();
-    // release IPC resources that we own
-    // NOTE: If you want to fully remove shared memory and queues on exit, uncomment:
-    // shmctl(shmget(SHM_KEY, 0, 0), IPC_RMID, NULL);
-    // msgctl(g_word_q, IPC_RMID, NULL);
-    // msgctl(g_req_q,  IPC_RMID, NULL);
-    // msgctl(g_resp_q, IPC_RMID, NULL);
-    _exit(0);
 }
 
 // ---------- Signal handlers (V1 demo) ----------
@@ -127,8 +142,8 @@ static void tracked_update(const char *name, time_t mtime) {
 static void send_line_to_queue(const char *eng, const char *fr, long dir_mtype) {
     MsgWord m; memset(&m, 0, sizeof(m));
     m.mtype = dir_mtype; // 1 EN->FR, 2 FR->EN
-    strncpy(m.english, eng, MAX_WORD_LENGTH-1);
-    strncpy(m.french,  fr, MAX_WORD_LENGTH-1);
+    snprintf(m.english, MAX_WORD_LENGTH, "%.*s", MAX_WORD_LENGTH-1, eng);
+    snprintf(m.french, MAX_WORD_LENGTH, "%.*s", MAX_WORD_LENGTH-1, fr);    
     if (msgsnd(g_word_q, &m, sizeof(MsgWord) - sizeof(long), 0) == -1) {
         perror("msgsnd(word)");
     }
@@ -170,15 +185,20 @@ static void read_word_pairs_from_file(const char *filepath, long *out_dir_mtype)
 }
 
 static void rescan_dictionary_once(int force_reload) {
-    DIR *dir = opendir(DICTIONARY_DIR);
-    if (!dir) {
-        perror("opendir(dictionary)");
-        return;
+    if (force_reload) {
+        pthread_mutex_lock(&g_dict->mutex);
+        g_dict->size = 0;
+        pthread_mutex_unlock(&g_dict->mutex);
+        g_tracked_count = 0; // reset tracked files
     }
+
+    DIR *dir = opendir(DICTIONARY_DIR);
+    if (!dir) { perror("opendir"); return; }
 
     struct dirent *de;
     while ((de = readdir(dir)) != NULL) {
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+
         char path[PATH_MAX];
         snprintf(path, sizeof(path), "%s/%s", DICTIONARY_DIR, de->d_name);
 
@@ -191,7 +211,7 @@ static void rescan_dictionary_once(int force_reload) {
             long dir_mtype = 1;
             read_word_pairs_from_file(path, &dir_mtype);
             tracked_update(de->d_name, st.st_mtime);
-        }        
+        }
     }
 
     closedir(dir);
@@ -200,11 +220,12 @@ static void rescan_dictionary_once(int force_reload) {
 // ---------- Threads ----------
 static void *writer_thread(void *arg) {
     (void)arg;
-    for (;;) {
+    while (g_running) {
         rescan_dictionary_once(0);
         printf("[DEBUG] Reload complete.\n");
         debug_print_dictionary();
-        sleep(5); // periodic scan
+
+        for (int i = 0; i < 5 && g_running; ++i) sleep(1); // sleep 5s but wake on stop
     }
     return NULL;
 }
@@ -212,25 +233,25 @@ static void *writer_thread(void *arg) {
 static void *reader_thread(void *arg) {
     (void)arg;
     MsgWord m;
-    for (;;) {
-        ssize_t n = msgrcv(g_word_q, &m, sizeof(MsgWord) - sizeof(long), 0, 0);
-        if (n == -1) { perror("msgrcv(word)"); continue; }
+    while (g_running) {
+        ssize_t n = msgrcv(g_word_q, &m, sizeof(MsgWord)-sizeof(long), 0, 0);
+        if (n == -1) {
+            if (errno == EINTR) continue;  // interrupted by signal
+            if (!g_running) break;         // exit cleanly
+            perror("msgrcv(word)");
+            continue;
+        }
 
         pthread_mutex_lock(&g_dict->mutex);
         if (g_dict->size < MAX_WORDS) {
-            if (m.mtype == 1) { // EN->FR as given
-                strncpy(g_dict->words[g_dict->size].english, m.english, MAX_WORD_LENGTH-1);
-                strncpy(g_dict->words[g_dict->size].french,  m.french,  MAX_WORD_LENGTH-1);
-            } else {            // FR->EN, normalize to english/french field order
-                strncpy(g_dict->words[g_dict->size].english, m.french,  MAX_WORD_LENGTH-1);
-                strncpy(g_dict->words[g_dict->size].french,  m.english, MAX_WORD_LENGTH-1);
+            if (m.mtype == 1) {
+                snprintf(g_dict->words[g_dict->size].english, MAX_WORD_LENGTH, "%s", m.english);
+                snprintf(g_dict->words[g_dict->size].french,  MAX_WORD_LENGTH, "%s", m.french);
+            } else {
+                snprintf(g_dict->words[g_dict->size].english, MAX_WORD_LENGTH, "%s", m.french);
+                snprintf(g_dict->words[g_dict->size].french,  MAX_WORD_LENGTH, "%s", m.english);
             }
             g_dict->size++;
-        } else {
-            // Dictionary is full; you can choose to overwrite or drop
-            // Here we simply drop and warn once in a while
-            if ((g_dict->size % 100) == 0)
-                fprintf(stderr, "[WARN] dictionary full, skipping pairs...\n");
         }
         pthread_mutex_unlock(&g_dict->mutex);
     }
@@ -242,9 +263,17 @@ static int lookup(int dir /*1 EN->FR, 2 FR->EN*/, const char *w, char out[MAX_WO
     pthread_mutex_lock(&g_dict->mutex);
     for (int i = 0; i < g_dict->size; ++i) {
         if (dir == 1) {
-            if (strcmp(g_dict->words[i].english, w) == 0) { strncpy(out, g_dict->words[i].french, MAX_WORD_LENGTH-1); found = 1; break; }
+            if (strcmp(g_dict->words[i].english, w) == 0) {
+                snprintf(out, MAX_WORD_LENGTH, "%s", g_dict->words[i].french);
+                found = 1;
+                break; 
+            }
         } else {
-            if (strcmp(g_dict->words[i].french,  w) == 0) { strncpy(out, g_dict->words[i].english, MAX_WORD_LENGTH-1); found = 1; break; }
+            if (strcmp(g_dict->words[i].french,  w) == 0) { 
+                snprintf(out, MAX_WORD_LENGTH, "%s", g_dict->words[i].english);
+                found = 1; 
+                break; 
+            }
         }
     }
     pthread_mutex_unlock(&g_dict->mutex);
@@ -254,34 +283,36 @@ static int lookup(int dir /*1 EN->FR, 2 FR->EN*/, const char *w, char out[MAX_WO
 static void *request_handler_thread(void *arg) {
     (void)arg;
     MsgReq r; MsgResp s;
-    for (;;) {
-        ssize_t n = msgrcv(g_req_q, &r, sizeof(MsgReq) - sizeof(long), 0, 0);
-        if (n == -1) { perror("msgrcv(req)"); continue; }
+    while (g_running) {
+        ssize_t n = msgrcv(g_req_q, &r, sizeof(MsgReq)-sizeof(long), 0, 0);
+        if (n == -1) {
+            if (errno == EINTR) continue;
+            if (!g_running) break;
+            perror("msgrcv(req)");
+            continue;
+        }
 
         memset(&s, 0, sizeof(s));
-        s.mtype = r.reply_to;   // reply specifically to that client PID
+        s.mtype = r.reply_to;
         s.req_id = r.req_id;
-        strncpy(s.from, r.word, MAX_WORD_LENGTH-1);
+        snprintf(s.from, MAX_WORD_LENGTH, "%s", r.word);
 
         char tmp[MAX_WORD_LENGTH] = {0};
-        int dir = (int)r.mtype; // 1 EN->FR, 2 FR->EN
+        int dir = (int)r.mtype;
         if (!lookup(dir, r.word, tmp)) {
-            // MISS: perform immediate rescan (V3 requirement), then recheck
             rescan_dictionary_once(1);
-            printf("[DEBUG] Reload complete.\n");
-            debug_print_dictionary();
             if (lookup(dir, r.word, tmp)) {
                 s.found = 1;
-                strncpy(s.to, tmp, MAX_WORD_LENGTH-1);
+                snprintf(s.to, MAX_WORD_LENGTH, "%s", tmp);
             } else {
                 s.found = 0;
             }
         } else {
             s.found = 1;
-            strncpy(s.to, tmp, MAX_WORD_LENGTH-1);
+            snprintf(s.to, MAX_WORD_LENGTH, "%s", tmp);
         }
 
-        if (msgsnd(g_resp_q, &s, sizeof(MsgResp) - sizeof(long), 0) == -1) {
+        if (msgsnd(g_resp_q, &s, sizeof(MsgResp)-sizeof(long), 0) == -1) {
             perror("msgsnd(resp)");
         }
     }
@@ -296,16 +327,24 @@ static SharedDictionary *attach_or_init_shm(void) {
     SharedDictionary *p = (SharedDictionary *)shmat(shmid, NULL, 0);
     if (p == (void *)-1) { perror("shmat"); return NULL; }
 
-    // One-time init of the process-shared mutex
+    // Reset SHM if it was previously initialized
+    pthread_mutexattr_t attr; 
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
+
     if (p->initialized != 1) {
         memset(p, 0, sizeof(*p));
-        pthread_mutexattr_t attr; pthread_mutexattr_init(&attr);
-        pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
         pthread_mutex_init(&p->mutex, &attr);
-        pthread_mutexattr_destroy(&attr);
         p->size = 0;
         p->initialized = 1;
+    } else {
+        // Reset contents even if mutex already initialized
+        pthread_mutex_lock(&p->mutex);
+        p->size = 0; // clear previous words
+        pthread_mutex_unlock(&p->mutex);
     }
+
+    pthread_mutexattr_destroy(&attr);
     return p;
 }
 
@@ -330,7 +369,12 @@ int main(void) {
         perror("write_pid_file");
     }
     atexit(remove_pid_file);
-    struct sigaction sa_term = {0}; sa_term.sa_handler = on_sigint_term; sigaction(SIGINT, &sa_term, NULL); sigaction(SIGTERM, &sa_term, NULL);
+    struct sigaction sa_term = {0};
+    sa_term.sa_handler = handle_term;
+    sigaction(SIGINT,  &sa_term, NULL);
+    sigaction(SIGTERM, &sa_term, NULL);
+
+    atexit(cleanup_ipc);
 
     // 3) Random demo signals (V1) — optional
     struct sigaction sa1 = {0}, sa2 = {0};

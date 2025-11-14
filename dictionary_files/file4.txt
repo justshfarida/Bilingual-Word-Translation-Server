@@ -1,0 +1,4 @@
+# direction: FR_EN
+soleil;sun
+eau;water
+garçon;boy

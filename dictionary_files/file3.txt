@@ -1,4 +1,4 @@
 # direction: FR_EN
-soleil;sun
-eau;water
+fille;girl
+ami;friend
 voiture;car
